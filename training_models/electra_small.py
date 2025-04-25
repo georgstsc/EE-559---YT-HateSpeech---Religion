@@ -1,27 +1,77 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
 from sklearn.metrics import accuracy_score, f1_score
 import pandas as pd
+import re
 from tqdm import tqdm
+import argparse
+import os
+import tempfile
 
-# ✅ Config
-model_name = "google/electra-small-discriminator"
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="Train ELECTRA model on hate speech dataset")
+parser.add_argument('--train_path', type=str, default="/home/schwabed/EE-559---YT-HateSpeech---Religion/data/train_balanced.csv",
+                    help="Path to training CSV file")
+parser.add_argument('--val_path', type=str, default="/home/schwabed/EE-559---YT-HateSpeech---Religion/data/val_balanced.csv",
+                    help="Path to validation CSV file")
+parser.add_argument('--model_path', type=str, default="/home/schwabed/EE-559---YT-HateSpeech---Religion/models/electra_small",
+                    help="Path to save trained ELECTRA model")
+parser.add_argument('--batch_size', type=int, default=16,
+                    help="Batch size for training")
+parser.add_argument('--epochs', type=int, default=10,
+                    help="Number of training epochs")
+parser.add_argument('--max_length', type=int, default=256,
+                    help="Maximum sequence length for tokenization")
+parser.add_argument('--learning_rate', type=float, default=5e-6,
+                    help="Learning rate for optimizer")
+args = parser.parse_args()
+
+# Config
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("🖥️ Device:", device)
+print(f"🖥️ Device: {device}")
 
-# ✅ Load data
-train_df = pd.read_csv("../data/train_balanced.csv")
-val_df = pd.read_csv("../data/val_balanced.csv")
-test_df = pd.read_csv("../data/test_balanced.csv")
+# Check write permissions for model_path
+def check_write_permission(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path, delete=True) as tmp_file:
+            tmp_file.write(b"Test write permission")
+            tmp_file.flush()
+        print(f"✅ Write permission confirmed for {path}")
+    except (OSError, PermissionError) as e:
+        raise PermissionError(f"Cannot write to {path}: {str(e)}")
 
-# ✅ Tokenizer
+check_write_permission(args.model_path)
+
+# Data cleaning function
+def clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r'http\S+', '', text)  # Remove URLs
+    text = re.sub(r'[^a-zA-Z\s]', '', text)  # Remove special characters
+    return text.strip()
+
+# Load and clean data
+train_df = pd.read_csv(args.train_path)
+val_df = pd.read_csv(args.val_path)
+if 'text' not in train_df.columns or 'label' not in train_df.columns:
+    raise ValueError("CSV files must have 'text' and 'label' columns")
+train_df['text'] = train_df['text'].apply(clean_text)
+val_df['text'] = val_df['text'].apply(clean_text)
+train_df = train_df[train_df['text'] != ''].dropna(subset=['text', 'label'])
+val_df = val_df[val_df['text'] != ''].dropna(subset=['text', 'label'])
+print(f"✅ Loaded {len(train_df)} training samples and {len(val_df)} validation samples")
+
+# Tokenizer
+model_name = "google/electra-small-discriminator"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# ✅ Dataset wrapper
+# Dataset wrapper
 class CommentDataset(Dataset):
-    def __init__(self, texts, labels):
-        self.encodings = tokenizer(texts.tolist(), truncation=True, padding=True, max_length=256)
+    def __init__(self, texts, labels, tokenizer, max_length):
+        self.encodings = tokenizer(texts.tolist(), truncation=True, padding=True, max_length=max_length, return_tensors='pt')
         self.labels = labels.tolist()
 
     def __len__(self):
@@ -29,44 +79,100 @@ class CommentDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'input_ids': torch.tensor(self.encodings['input_ids'][idx]),
-            'attention_mask': torch.tensor(self.encodings['attention_mask'][idx]),
+            'input_ids': self.encodings['input_ids'][idx],
+            'attention_mask': self.encodings['attention_mask'][idx],
             'labels': torch.tensor(self.labels[idx])
         }
 
-# ✅ Prepare datasets & loaders
-train_data = CommentDataset(train_df['text'], train_df['label'])
-val_data = CommentDataset(val_df['text'], val_df['label'])
-test_data = CommentDataset(test_df['text'], test_df['label'])
+# Prepare datasets & loaders
+train_data = CommentDataset(train_df['text'], train_df['label'], tokenizer, args.max_length)
+val_data = CommentDataset(val_df['text'], val_df['label'], tokenizer, args.max_length)
+train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False)
 
-train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
-val_loader = DataLoader(val_data, batch_size=64)
-test_loader = DataLoader(test_data, batch_size=64)
-
-# ✅ Model
+# Model
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
 model.to(device)
 
-# ✅ Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+# Compute class weights
+class_counts = train_df['label'].value_counts().sort_index().values
+total_samples = sum(class_counts)
+class_weights = torch.tensor([total_samples / (2.0 * count) for count in class_counts], dtype=torch.float).to(device)
+print(f"✅ Class weights: {class_weights.tolist()}")
+criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
-# ✅ Training loop
-epochs = 3
-for epoch in range(epochs):
+# Optimizer and scheduler
+optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+total_steps = len(train_loader) * args.epochs
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.learning_rate, steps_per_epoch=len(train_loader), epochs=args.epochs)
+
+# Training loop
+best_f1 = 0.0
+patience = 3
+counter = 0
+for epoch in range(args.epochs):
     model.train()
-    total_loss = 0
-    for batch in tqdm(train_loader, desc=f"🚀 Epoch {epoch+1}/{epochs}"):
+    train_loss = 0
+    for batch in tqdm(train_loader, desc=f"🚀 Training Epoch {epoch+1}/{args.epochs}"):
         batch = {k: v.to(device) for k, v in batch.items()}
         outputs = model(**batch)
-        loss = outputs.loss
+        loss = criterion(outputs.logits, batch['labels'])
+        if torch.isnan(loss):
+            print(f"❌ NaN loss detected at epoch {epoch+1}. Inputs:", batch['input_ids'], batch['labels'])
+            break
+        train_loss += loss.item()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
-        total_loss += loss.item()
-    print(f"✅ Avg Training Loss (epoch {epoch+1}): {total_loss / len(train_loader):.4f}")
 
-# ✅ Save model
-save_path = "../models/electra-small-hate"
-model.save_pretrained(save_path)
-tokenizer.save_pretrained(save_path)
-print(f"✅ Model saved to: {save_path}")
+    if torch.isnan(loss):
+        break
+
+    avg_train_loss = train_loss / len(train_loader)
+    print(f"✅ Epoch {epoch+1} - Average Training Loss: {avg_train_loss:.4f}")
+
+    # Validation
+    model.eval()
+    val_preds, val_labels = [], []
+    val_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Validating"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = criterion(outputs.logits, batch['labels'])
+            val_loss += loss.item()
+            preds = torch.argmax(outputs.logits, dim=-1)
+            val_preds.extend(preds.cpu().tolist())
+            val_labels.extend(batch['labels'].cpu().tolist())
+
+    avg_val_loss = val_loss / len(val_loader)
+    val_accuracy = accuracy_score(val_labels, val_preds)
+    val_f1 = f1_score(val_labels, val_preds, zero_division=0)
+    print(f"✅ Epoch {epoch+1} - Average Validation Loss: {avg_val_loss:.4f}")
+    print(f"Validation Accuracy: {val_accuracy:.4f}")
+    print(f"Validation F1 Score: {val_f1:.4f}")
+
+    # Save model if F1 improves
+    if val_f1 > best_f1:
+        best_f1 = val_f1
+        counter = 0
+        os.makedirs(args.model_path, exist_ok=True)
+        model.save_pretrained(args.model_path)
+        tokenizer.save_pretrained(args.model_path)
+        print(f"✅ New best F1 score: {best_f1:.4f}. Model saved to {args.model_path}")
+    else:
+        counter += 1
+        if counter >= patience:
+            print(f"✅ No improvement in F1 for {patience} epochs. Stopping early.")
+            break
+
+# Final save to ensure model is saved
+if best_f1 > 0.0:
+    os.makedirs(args.model_path, exist_ok=True)
+    model.save_pretrained(args.model_path)
+    tokenizer.save_pretrained(args.model_path)
+    print(f"✅ Training completed. Final model saved to {args.model_path}")
+else:
+    print("❌ Training failed to produce a valid model (F1 score remained 0).")
