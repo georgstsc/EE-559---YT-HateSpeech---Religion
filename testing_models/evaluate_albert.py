@@ -8,12 +8,23 @@ import argparse
 import os
 
 # Parse command-line arguments
+# parser = argparse.ArgumentParser(description="Evaluate ALBERT model on a test dataset")
+# parser.add_argument('--data_path', type=str, required=True,
+#                     help="Path to test CSV file (must have 'text' and 'label' columns)")
+# parser.add_argument('--output_path', type=str, required=True,
+#                     help="Path to save predictions CSV")
+# parser.add_argument('--model_path', type=str, default="/home/schwabed/EE-559---YT-HateSpeech---Religion/models/albert_base",
+#                     help="Path to trained ALBERT model")
+# parser.add_argument('--batch_size', type=int, default=64,
+#                     help="Batch size for evaluation")
+# parser.add_argument('--max_length', type=int, default=256,
+#                     help="Maximum sequence length for tokenization")
+# args = parser.parse_args()
+
 parser = argparse.ArgumentParser(description="Evaluate ALBERT model on a test dataset")
-parser.add_argument('--data_path', type=str, required=True,
-                    help="Path to test CSV file (must have 'text' and 'label' columns)")
-parser.add_argument('--output_path', type=str, required=True,
-                    help="Path to save predictions CSV")
-parser.add_argument('--model_path', type=str, default="/home/schwabed/EE-559---YT-HateSpeech---Religion/models/albert_base",
+parser.add_argument('--data_path', type=str, default="../data/test_balanced.csv")
+parser.add_argument('--output_path', type=str, default="../output_test")
+parser.add_argument('--model_path', type=str, default="../models/albert_base_retrained",
                     help="Path to trained ALBERT model")
 parser.add_argument('--batch_size', type=int, default=64,
                     help="Batch size for evaluation")
