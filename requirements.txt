@@ -1,5 +1,6 @@
-torch
-transformers
-scikit-learn
-pandas
-tqdm
+torch>=2.0.1
+transformers==4.44.2
+scikit-learn>=1.5.1
+pandas>=2.0.3
+tqdm>=4.66.5
+optuna==4.0.0
