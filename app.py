@@ -3,18 +3,36 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch.nn.functional as F
 import re
-import whisper
+import os
+try:
+    import openai_whisper as whisper
+except ImportError:
+    try:
+        import whisper
+    except ImportError:
+        whisper = None
+        print("⚠️ Whisper not available - voice input will be disabled")
+
 from langdetect import detect
 from deep_translator import GoogleTranslator
 
-# ✅ Load classification model & tokenizer
-model_path = "models/bert-tiny-hate"
+# ✅ Load DistilBERT classification model & tokenizer
+model_path = "models/distilbert_base_optuna"  # Updated to use DistilBERT model
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
 model.eval()
 
-# ✅ Load Whisper model for voice input
-whisper_model = whisper.load_model("base")
+# ✅ Load Whisper model for voice input (if available)
+whisper_model = None
+if whisper and hasattr(whisper, 'load_model'):
+    try:
+        whisper_model = whisper.load_model("base")
+        print("✅ Whisper model loaded successfully")
+    except Exception as e:
+        print(f"⚠️ Failed to load Whisper model: {e}")
+        whisper_model = None
+else:
+    print("⚠️ Whisper not properly installed - voice input disabled")
 
 # ✅ Religion-related keywords
 religion_keywords = [
@@ -58,7 +76,7 @@ def extract_keywords(text):
 
 def highlight_words(text):
     words = text.split()
-    base_inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=256)
+    base_inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=256)  # Updated max_length for DistilBERT
     with torch.no_grad():
         base_output = model(**base_inputs)
         base_score = F.softmax(base_output.logits, dim=1)[0][1].item()
@@ -81,16 +99,24 @@ def predict_hate(text):
 
     detected = detect_lang(text)
     translated_text = translate_to_en(text, detected)
+    
+    # Check for religion keywords in both original and translated text
+    text_to_check = translated_text if translated_text != "No translation applied" else text
+    found_keywords = extract_keywords(text_to_check)
+    
+    # If no religion keywords found, don't make prediction
+    if not found_keywords:
+        return "⚠️ No prediction available - No religion-related keywords detected", detected, translated_text, []
 
     inputs = tokenizer(
-        translated_text if translated_text != "No translation applied" else text,
-        return_tensors="pt", truncation=True, padding=True, max_length=256
+        text_to_check,
+        return_tensors="pt", truncation=True, padding=True, max_length=256  # Updated max_length for DistilBERT
     )
     with torch.no_grad():
         outputs = model(**inputs)
         probs = F.softmax(outputs.logits, dim=1)[0]
 
-    highlights = highlight_words(translated_text if translated_text != "No translation applied" else text)
+    highlights = highlight_words(text_to_check)
     label_probs = {
         "Religious Hate": round(probs[1].item(), 3),
         "Not Hate": round(probs[0].item(), 3)
@@ -98,9 +124,29 @@ def predict_hate(text):
 
     return label_probs, detected, translated_text, highlights
 
-def transcribe_and_predict(audio_path):
-    transcription = whisper_model.transcribe(audio_path)["text"]
-    return predict_hate(transcription)
+def transcribe_and_predict(audio_input):
+    if whisper_model is None:
+        return "⚠️ Voice input not available - Whisper model not loaded", "—", "—", []
+    
+    try:
+        # Handle different audio input formats
+        if audio_input is None:
+            return "⚠️ No audio provided", "—", "—", []
+        
+        # If audio_input is a tuple (sample_rate, audio_data), use the file path
+        if isinstance(audio_input, tuple):
+            audio_path = audio_input[1] if len(audio_input) > 1 else audio_input[0]
+        else:
+            audio_path = audio_input
+            
+        # Ensure we have a valid file path
+        if audio_path is None or not os.path.exists(str(audio_path)):
+            return "⚠️ Invalid audio file", "—", "—", []
+            
+        transcription = whisper_model.transcribe(str(audio_path))["text"]
+        return predict_hate(transcription)
+    except Exception as e:
+        return f"⚠️ Transcription error: {str(e)}", "—", "—", []
 
 def file_input_handler(file):
     with open(file.name, "r") as f:
@@ -109,7 +155,6 @@ def file_input_handler(file):
 
 # 🎨 Examples + UI
 examples = [
-    "Musulmans, partez d'ici!",
     "Je suis fier d'être chrétien.",
     "La Bible est pleine de sagesse.",
     "Die Religion ist das Problem.",
@@ -117,14 +162,20 @@ examples = [
     "Pope Francis inspires many.",
 ]
 
-intro_title = "<h1 style='text-align: center; font-size: 36px;'>🇨🇭 Swiss Religious Hate Speech Detector"
+intro_title = "<h1 style='text-align: center; font-size: 36px;'>🇨🇭 Swiss Religious Hate Speech Detector (DistilBERT)"
 description = """
 🕊️ This model detects **religious hate speech** in Switzerland's four national languages: **French**, **German**, **Italian**, and **English**.
 
+🤖 **Powered by DistilBERT:** This version uses an optimized DistilBERT model trained with hyperparameter tuning for improved accuracy and efficiency.
+
 🌍 The app auto-detects the language, translates it to English, and analyzes it for religious hate.
 
-⚠️ **Disclaimer:** The model was trained on comments containing religion-related keywords.
-Best results are achieved when text includes terms like *"muslim"*, *"jewish"*, *"christian"*, *"bible"*, *"god"*, etc.
+⚠️ **Required Keywords:** The model ONLY makes predictions when religion-related keywords are detected. Text must contain at least one of these keywords:
+- **Islam/Muslim:** muslim, islam, islamic
+- **Judaism:** jew, jewish, judaism  
+- **Christianity:** christian, christianity, bible, jesus, god, catholic, pope
+- **Other religions:** hindu, hinduism, buddha, buddhist
+- **General:** atheist, religion, religious
 
 💡 Word importance scores explain which words influenced the prediction.
 """
@@ -149,16 +200,19 @@ with gr.Blocks(theme=gr.themes.Base()) as app:
             )
 
         with gr.TabItem("🎤 Voice Input"):
-            gr.Interface(
-                fn=transcribe_and_predict,
-                inputs=gr.Audio(type="filepath", label="Speak a comment"),
-                outputs=[
-                    gr.Label(label="Prediction"),
-                    gr.Textbox(label="Detected Language"),
-                    gr.Textbox(label="Translated Text"),
-                    gr.HighlightedText(label="Word Importance")
-                ]
-            )
+            if whisper_model is not None:
+                gr.Interface(
+                    fn=transcribe_and_predict,
+                    inputs=gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or upload audio"),
+                    outputs=[
+                        gr.Label(label="Prediction"),
+                        gr.Textbox(label="Detected Language"),
+                        gr.Textbox(label="Translated Text"),
+                        gr.HighlightedText(label="Word Importance")
+                    ]
+                )
+            else:
+                gr.Markdown("⚠️ **Voice input unavailable** - Whisper model not loaded. Please install: `pip install openai-whisper`")
 
         with gr.TabItem("📄 File Upload"):
             gr.Interface(
